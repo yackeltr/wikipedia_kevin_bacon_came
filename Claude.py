@@ -44,6 +44,10 @@ MAX_DISAMBIGUATION_OPTIONS = 15
 MAX_BFS_DEPTH = 6  # Maximum path length (edges)
 MAX_NODES_EXPLORED = 50000  # Maximum total nodes to explore
 
+# Performance optimization: cache person checks and links
+_person_cache = {}  # Cache for is_person checks
+_links_cache = {}   # Cache for person links
+
 
 # ============================================================================
 # HTTP Helper Functions
@@ -374,7 +378,7 @@ def is_person(wikipedia_title: str) -> bool:
 def batch_check_persons(titles: List[str]) -> Set[str]:
     """
     Check multiple Wikipedia titles to see which are about people.
-    Uses batch API requests for efficiency.
+    Uses batch API requests for efficiency and caching.
     
     Args:
         titles: List of Wikipedia article titles
@@ -385,12 +389,24 @@ def batch_check_persons(titles: List[str]) -> Set[str]:
     if not titles:
         return set()
     
+    # Check cache first
+    uncached_titles = []
     people = set()
     
-    # Process in batches of 50 (API limit)
+    for title in titles:
+        if title in _person_cache:
+            if _person_cache[title]:
+                people.add(title)
+        else:
+            uncached_titles.append(title)
+    
+    if not uncached_titles:
+        return people
+    
+    # Process uncached titles in batches of 50 (API limit)
     batch_size = 50
-    for i in range(0, len(titles), batch_size):
-        batch = titles[i:i + batch_size]
+    for i in range(0, len(uncached_titles), batch_size):
+        batch = uncached_titles[i:i + batch_size]
         
         # Get Wikidata item IDs for batch
         params = {
@@ -411,6 +427,9 @@ def batch_check_persons(titles: List[str]) -> Set[str]:
             wikibase_item = pageprops.get('wikibase_item')
             if title and wikibase_item:
                 title_to_id[title] = wikibase_item
+            elif title:
+                # No wikibase item = not a person
+                _person_cache[title] = False
         
         # Batch query Wikidata for P31 claims
         if title_to_id:
@@ -429,6 +448,7 @@ def batch_check_persons(titles: List[str]) -> Set[str]:
                 entity = entities.get(item_id, {})
                 claims = entity.get('claims', {}).get('P31', [])
                 
+                is_person = False
                 for claim in claims:
                     mainsnak = claim.get('mainsnak', {})
                     if mainsnak.get('snaktype') == 'value':
@@ -436,8 +456,12 @@ def batch_check_persons(titles: List[str]) -> Set[str]:
                         if datavalue.get('type') == 'wikibase-entityid':
                             entity_id = datavalue.get('value', {}).get('id')
                             if entity_id == 'Q5':
+                                is_person = True
                                 people.add(title)
                                 break
+                
+                # Cache the result
+                _person_cache[title] = is_person
     
     return people
 
@@ -449,6 +473,7 @@ def batch_check_persons(titles: List[str]) -> Set[str]:
 def get_person_links(title: str) -> List[str]:
     """
     Get all outbound links from a Wikipedia article, filtered to people only.
+    Uses caching to avoid redundant API calls.
     
     This function enforces the people-only graph constraint by:
     1. Extracting all links from the article
@@ -461,6 +486,10 @@ def get_person_links(title: str) -> List[str]:
     Returns:
         List of article titles (people only) linked from this article
     """
+    # Check cache first
+    if title in _links_cache:
+        return _links_cache[title]
+    
     all_links = []
     plcontinue = None
     
@@ -490,10 +519,13 @@ def get_person_links(title: str) -> List[str]:
         else:
             break
     
-    # Filter to people only using Wikidata
-    person_links = batch_check_persons(all_links)
+    # Filter to people only using Wikidata (with caching)
+    person_links = list(batch_check_persons(all_links))
     
-    return list(person_links)
+    # Cache the result
+    _links_cache[title] = person_links
+    
+    return person_links
 
 
 def get_article_snippet(source_title: str, target_title: str) -> Optional[str]:
@@ -683,6 +715,12 @@ def find_shortest_path(start: str, goal: str) -> Optional[List[str]]:
     - Stops when frontiers meet at a common person
     - Reconstructs path using parent pointers from both directions
     
+    Optimizations:
+    - Caches person checks and link lists to avoid redundant API calls
+    - Uses sets for O(1) membership checking
+    - Processes nodes in batches when possible
+    - Early termination when paths are found
+    
     Args:
         start: Starting person's Wikipedia title
         goal: Goal person's Wikipedia title
@@ -724,7 +762,7 @@ def find_shortest_path(start: str, goal: str) -> Optional[List[str]]:
             if current_depth >= MAX_BFS_DEPTH:
                 continue
             
-            # Get links to other people
+            # Get links to other people (cached)
             try:
                 neighbors = get_person_links(current)
             except:
@@ -752,10 +790,9 @@ def find_shortest_path(start: str, goal: str) -> Optional[List[str]]:
                         start, goal, neighbor,
                         forward_parent, backward_parent
                     )
-                    # Verify the path is complete and correct
+                    # Verify and return immediately (BFS guarantees shortest)
                     if path and path[0] == start and path[-1] == goal:
                         return path
-                    # Otherwise continue searching
                 
                 # Add to forward frontier
                 if neighbor not in forward_visited:
@@ -766,8 +803,9 @@ def find_shortest_path(start: str, goal: str) -> Optional[List[str]]:
             
             if nodes_explored % 50 == 0:
                 print(f"  Explored {nodes_explored} nodes, "
-                      f"forward frontier: {len(forward_queue)}, "
-                      f"backward frontier: {len(backward_queue)}")
+                      f"forward: {len(forward_queue)}, "
+                      f"backward: {len(backward_queue)}, "
+                      f"cache: {len(_links_cache)} links")
         
         elif backward_queue:
             # Backward expansion
@@ -777,7 +815,7 @@ def find_shortest_path(start: str, goal: str) -> Optional[List[str]]:
             if current_depth >= MAX_BFS_DEPTH:
                 continue
             
-            # Get links to other people
+            # Get links to other people (cached)
             try:
                 neighbors = get_person_links(current)
             except:
@@ -803,10 +841,9 @@ def find_shortest_path(start: str, goal: str) -> Optional[List[str]]:
                         start, goal, neighbor,
                         forward_parent, backward_parent
                     )
-                    # Verify the path is complete and correct
+                    # Verify and return immediately (BFS guarantees shortest)
                     if path and path[0] == start and path[-1] == goal:
                         return path
-                    # Otherwise continue searching
                 
                 # Add to backward frontier
                 if neighbor not in backward_visited:

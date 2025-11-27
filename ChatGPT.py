@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
+
+# --- Silence urllib3 LibreSSL warnings BEFORE any imports ---
+import warnings
+try:
+    from urllib3.exceptions import NotOpenSSLWarning
+    warnings.filterwarnings("ignore", category=NotOpenSSLWarning)
+except Exception:
+    pass
+
 """
 People-Only Wikipedia Degrees-of-Separation Finder
-with Link Verification
+with Batched Wikidata & Link Verification (Optimized)
 
 Requirements:
     - Python 3.8+
@@ -15,10 +24,14 @@ Overview:
     English Wikipedia, with the constraint that *every* node in the chain
     must be a person (human) according to Wikidata (instance of Q5).
 
-    It then verifies each hop in the chain by:
-        - Fetching the HTML for the source article.
-        - Locating the actual hyperlink (<a href="/wiki/Target_Title">).
-        - Printing the exact anchor tag and a small HTML snippet around it.
+    It uses:
+        - Bidirectional BFS (forward via outgoing links, backward via backlinks).
+        - Batched queries to Wikipedia + Wikidata to determine which articles
+          represent humans, drastically reducing network overhead.
+        - Post-hoc verification of each hop via raw HTML:
+            * Fetch source page HTML.
+            * Find the <a href="/wiki/Target_Title"> anchor.
+            * Print the anchor tag and a short context snippet.
 """
 
 import sys
@@ -26,17 +39,6 @@ import time
 from typing import Dict, List, Optional, Set, Tuple
 
 import requests
-
-# Suppress the noisy NotOpenSSLWarning from urllib3 v2 on macOS LibreSSL builds.
-try:
-    from urllib3.exceptions import NotOpenSSLWarning
-    import warnings
-
-    warnings.filterwarnings("ignore", category=NotOpenSSLWarning)
-except Exception:
-    # If urllib3 isn't structured as expected, just ignore; it's not fatal.
-    pass
-
 
 WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/api.php"
 WIKIDATA_API_URL = "https://www.wikidata.org/w/api.php"
@@ -76,8 +78,9 @@ class WikipediaClient:
         - Search for pages by name.
         - Resolve titles, including redirects and disambiguation pages.
         - Retrieve outgoing links and incoming links (backlinks).
-        - Determine if a page is a human via Wikidata (instance of Q5).
-        - Cache all of the above aggressively to reduce network calls.
+        - Determine if a page is a human via Wikidata (instance of Q5),
+          using batched lookups for speed.
+        - Cache all of the above aggressively.
         - Fetch raw HTML for verification.
     """
 
@@ -89,8 +92,8 @@ class WikipediaClient:
         self.session.headers.update(
             {
                 "User-Agent": (
-                    "PeopleOnlyWikipediaDegrees/1.2 "
-                    "(Python script for shortest path computation with link verification)"
+                    "PeopleOnlyWikipediaDegrees/2.0 "
+                    "(Optimized Python script with batched Wikidata + link verification)"
                 )
             }
         )
@@ -310,60 +313,117 @@ class WikipediaClient:
         self.links_to_cache[title] = backlinks
         return backlinks
 
-    # ------------------------ Wikidata human detection ------------------------
+    # ------------------------ Batched Wikidata human detection ------------------------
 
-    def _get_wikidata_id(self, title: str) -> Optional[str]:
-        if title in self.wikidata_id_cache:
-            return self.wikidata_id_cache[title]
+    def _ensure_pageprops_for_titles(self, titles: Set[str]) -> None:
+        """
+        Ensure wikidata_id_cache is populated for all given titles.
 
-        try:
-            page = self._get_page_info(title)
-        except PageNotFoundError:
-            self.wikidata_id_cache[title] = None
-            return None
+        Uses batched Wikipedia queries to fetch pageprops for up to 50 titles at a time.
+        """
+        missing = [t for t in titles if t not in self.wikidata_id_cache]
+        if not missing:
+            return
 
-        props = page.get("pageprops", {})
-        wd_id = props.get("wikibase_item")
-        self.wikidata_id_cache[title] = wd_id
-        return wd_id
+        chunk_size = 50
+        for i in range(0, len(missing), chunk_size):
+            chunk = missing[i : i + chunk_size]
+            # Titles parameter expects '|' separated list
+            params = {
+                "action": "query",
+                "prop": "pageprops",
+                "titles": "|".join(chunk),
+                "redirects": 1,
+            }
+            data = self._api_get(params)
+            pages = data.get("query", {}).get("pages", [])
+
+            # First, mark everything as None; then overwrite as we find IDs.
+            for t in chunk:
+                self.wikidata_id_cache.setdefault(t, None)
+
+            for page in pages:
+                title = page.get("title")
+                if not title:
+                    continue
+                props = page.get("pageprops", {})
+                wd_id = props.get("wikibase_item")
+                self.wikidata_id_cache[title] = wd_id
+
+    def ensure_humans_for_titles(self, titles: Set[str]) -> None:
+        """
+        Ensure human_cache is populated (True/False) for all given titles.
+
+        This is the key optimization: instead of calling Wikidata per title,
+        we:
+            - Batch-fetch pageprops for all titles to get Wikidata IDs.
+            - Batch-fetch wbgetentities for all those IDs to see if they are Q5.
+        """
+        # Titles we haven't classified yet.
+        to_classify = [t for t in titles if t not in self.human_cache]
+        if not to_classify:
+            return
+
+        # Step 1: make sure we have Wikidata IDs for all of them.
+        self._ensure_pageprops_for_titles(set(to_classify))
+
+        # Map: wd_id -> [titles]
+        ids_to_titles: Dict[str, List[str]] = {}
+        for t in to_classify:
+            wd_id = self.wikidata_id_cache.get(t)
+            if not wd_id:
+                # No Wikidata item -> not a human
+                self.human_cache[t] = False
+            else:
+                ids_to_titles.setdefault(wd_id, []).append(t)
+
+        if not ids_to_titles:
+            return
+
+        # Step 2: batch wbgetentities by up to 50 IDs at a time.
+        all_ids = list(ids_to_titles.keys())
+        chunk_size = 50
+        for i in range(0, len(all_ids), chunk_size):
+            id_chunk = all_ids[i : i + chunk_size]
+            params = {
+                "action": "wbgetentities",
+                "ids": "|".join(id_chunk),
+                "props": "claims",
+            }
+            try:
+                data = self._wikidata_get(params)
+            except WikipediaAPIError:
+                # If Wikidata fails, pessimistically mark them as non-humans.
+                for wd_id in id_chunk:
+                    for title in ids_to_titles.get(wd_id, []):
+                        self.human_cache[title] = False
+                continue
+
+            entities = data.get("entities", {})
+            for wd_id in id_chunk:
+                titles_for_id = ids_to_titles.get(wd_id, [])
+                entity = entities.get(wd_id, {})
+                claims = entity.get("claims", {})
+                p31 = claims.get("P31", [])
+                is_human_flag = False
+                for claim in p31:
+                    mainsnak = claim.get("mainsnak", {})
+                    datavalue = mainsnak.get("datavalue", {})
+                    value = datavalue.get("value", {})
+                    if isinstance(value, dict) and value.get("id") == "Q5":
+                        is_human_flag = True
+                        break
+                for title in titles_for_id:
+                    self.human_cache[title] = is_human_flag
 
     def is_human(self, title: str) -> bool:
-        if title in self.human_cache:
-            return self.human_cache[title]
+        """
+        Return cached human classification for a title.
 
-        wd_id = self._get_wikidata_id(title)
-        if not wd_id:
-            self.human_cache[title] = False
-            return False
-
-        params = {
-            "action": "wbgetentities",
-            "ids": wd_id,
-            "props": "claims",
-        }
-
-        try:
-            data = self._wikidata_get(params)
-        except WikipediaAPIError:
-            self.human_cache[title] = False
-            return False
-
-        entities = data.get("entities", {})
-        entity = entities.get(wd_id, {})
-        claims = entity.get("claims", {})
-        p31 = claims.get("P31", [])
-
-        is_human_flag = False
-        for claim in p31:
-            mainsnak = claim.get("mainsnak", {})
-            datavalue = mainsnak.get("datavalue", {})
-            value = datavalue.get("value", {})
-            if isinstance(value, dict) and value.get("id") == "Q5":
-                is_human_flag = True
-                break
-
-        self.human_cache[title] = is_human_flag
-        return is_human_flag
+        NOTE: In the optimized BFS, you should usually call ensure_humans_for_titles()
+        first on a batch, then this becomes a cheap lookup.
+        """
+        return self.human_cache.get(title, False)
 
     # ------------------------ HTML fetch for verification ------------------------
 
@@ -382,7 +442,7 @@ class WikipediaClient:
 
 
 # ---------------------------------------------------------------------------
-# Bidirectional BFS (people-only)
+# Bidirectional BFS (people-only, batched human checks)
 # ---------------------------------------------------------------------------
 
 
@@ -396,20 +456,17 @@ def bidirectional_shortest_path(
     """
     Bidirectional BFS over the people-only Wikipedia graph.
 
-    Nodes:
-        - Wikipedia article titles that are humans via Wikidata (Q5).
-
-    Edges:
-        - Directed hyperlinks between those articles.
-
-    Returns:
-        (path, expanded_count):
-            - path: start → ... → goal, or [] if not found.
-            - expanded_count: number of nodes expanded during search.
+    Key optimization:
+        For each BFS wave, we:
+            - Collect all neighbors across the frontier.
+            - Batch-classify them with ensure_humans_for_titles().
+            - Then cheaply filter by client.is_human(title).
     """
     if start == goal:
         return [start], 0
 
+    # Ensure endpoints are human (using the fast batch system too).
+    client.ensure_humans_for_titles({start, goal})
     if not client.is_human(start):
         raise ValueError(f"Start page '{start}' is not classified as a human in Wikidata.")
     if not client.is_human(goal):
@@ -432,13 +489,23 @@ def bidirectional_shortest_path(
             )
 
         if len(frontier_forward) <= len(frontier_backward):
+            # Expand forward: collect neighbors for the whole frontier.
             current_frontier = frontier_forward
             next_frontier: Set[str] = set()
+            neighbors_by_node: Dict[str, Set[str]] = {}
+            all_neighbors: Set[str] = set()
 
             for node in current_frontier:
                 expanded_count += 1
                 neighbors = client.get_links_from(node)
+                neighbors_by_node[node] = neighbors
+                all_neighbors.update(neighbors)
 
+            # Batch human classification for all neighbors in this wave.
+            client.ensure_humans_for_titles(all_neighbors)
+
+            # Now do the actual BFS expansion with cheap lookups.
+            for node, neighbors in neighbors_by_node.items():
                 for nbr in neighbors:
                     if not client.is_human(nbr):
                         continue
@@ -452,13 +519,22 @@ def bidirectional_shortest_path(
             frontier_forward = next_frontier
 
         else:
+            # Expand backward: collect backlinks for the whole frontier.
             current_frontier = frontier_backward
-            next_frontier = set()
+            next_frontier: Set[str] = set()
+            neighbors_by_node: Dict[str, Set[str]] = {}
+            all_neighbors: Set[str] = set()
 
             for node in current_frontier:
                 expanded_count += 1
                 neighbors = client.get_links_to(node)
+                neighbors_by_node[node] = neighbors
+                all_neighbors.update(neighbors)
 
+            # Batch human classification for all neighbors in this wave.
+            client.ensure_humans_for_titles(all_neighbors)
+
+            for node, neighbors in neighbors_by_node.items():
                 for nbr in neighbors:
                     if not client.is_human(nbr):
                         continue
@@ -508,16 +584,12 @@ def _extract_anchor_and_context(html: str, dst_slug: str) -> Tuple[Optional[str]
     try to extract:
         - The full <a ...>...</a> tag that links to that slug.
         - A short context snippet around it.
-
-    Returns:
-        (anchor_tag, context_snippet) or (None, None) if not found.
     """
     needle = f'/wiki/{dst_slug}'
     idx = html.find(needle)
     if idx == -1:
         return None, None
 
-    # Try to find the start of the enclosing <a ...> tag.
     a_start = html.rfind("<a", 0, idx)
     a_end = html.find("</a>", idx)
     if a_start == -1 or a_end == -1:
@@ -525,7 +597,6 @@ def _extract_anchor_and_context(html: str, dst_slug: str) -> Tuple[Optional[str]
     a_end += len("</a>")
     anchor = html[a_start:a_end]
 
-    # Build a short, cleaned context snippet around the anchor.
     context_radius = 140
     context_start = max(0, a_start - context_radius)
     context_end = min(len(html), a_end + context_radius)
@@ -620,6 +691,7 @@ def main() -> None:
         print(f"Resolved Person B to: {title_b}")
 
         print("\nVerifying endpoints are people...")
+        client.ensure_humans_for_titles({title_a, title_b})
         if not client.is_human(title_a):
             print(f"'{title_a}' is not classified as a human in Wikidata. Exiting.")
             sys.exit(1)
@@ -627,7 +699,7 @@ def main() -> None:
             print(f"'{title_b}' is not classified as a human in Wikidata. Exiting.")
             sys.exit(1)
         print(f"Endpoints verified. Starting search: {title_a} <-> {title_b}")
-        print("Note: Expansion speed is limited by Wikidata 'is-human' checks.\n")
+        print("Note: Expansion speed is limited by batched Wikidata 'is-human' checks.\n")
 
         if title_a == title_b:
             total_time = time.time() - overall_start
@@ -675,7 +747,6 @@ def main() -> None:
         print(f"Nodes Expanded: {expanded}")
         print("========================================")
 
-        # Verify hyperlinks with parsed anchors + context.
         verify_path_links(client, path)
 
     except PageNotFoundError as e:

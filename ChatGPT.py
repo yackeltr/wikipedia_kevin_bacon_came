@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 
-# --- Silence urllib3 LibreSSL warnings BEFORE any imports ---
 import warnings
-try:
-    from urllib3.exceptions import NotOpenSSLWarning
-    warnings.filterwarnings("ignore", category=NotOpenSSLWarning)
-except Exception:
-    pass
+
+# Suppress urllib3 warnings (e.g., NotOpenSSLWarning) without importing urllib3 explicitly
+warnings.filterwarnings("ignore", module="urllib3")
 
 """
 People-Only Wikipedia Degrees-of-Separation Finder
-with Batched Wikidata & Link Verification (Optimized)
+(Optimized, minimal console formatting)
 
 Requirements:
     - Python 3.8+
@@ -18,20 +15,6 @@ Requirements:
 
 Install dependency (inside your virtual environment):
     python -m pip install requests
-
-Overview:
-    This script finds the shortest chain of hyperlinks between two people on
-    English Wikipedia, with the constraint that *every* node in the chain
-    must be a person (human) according to Wikidata (instance of Q5).
-
-    It uses:
-        - Bidirectional BFS (forward via outgoing links, backward via backlinks).
-        - Batched queries to Wikipedia + Wikidata to determine which articles
-          represent humans, drastically reducing network overhead.
-        - Post-hoc verification of each hop via raw HTML:
-            * Fetch source page HTML.
-            * Find the <a href="/wiki/Target_Title"> anchor.
-            * Print the anchor tag and a short context snippet.
 """
 
 import sys
@@ -316,11 +299,6 @@ class WikipediaClient:
     # ------------------------ Batched Wikidata human detection ------------------------
 
     def _ensure_pageprops_for_titles(self, titles: Set[str]) -> None:
-        """
-        Ensure wikidata_id_cache is populated for all given titles.
-
-        Uses batched Wikipedia queries to fetch pageprops for up to 50 titles at a time.
-        """
         missing = [t for t in titles if t not in self.wikidata_id_cache]
         if not missing:
             return
@@ -328,7 +306,6 @@ class WikipediaClient:
         chunk_size = 50
         for i in range(0, len(missing), chunk_size):
             chunk = missing[i : i + chunk_size]
-            # Titles parameter expects '|' separated list
             params = {
                 "action": "query",
                 "prop": "pageprops",
@@ -338,7 +315,6 @@ class WikipediaClient:
             data = self._api_get(params)
             pages = data.get("query", {}).get("pages", [])
 
-            # First, mark everything as None; then overwrite as we find IDs.
             for t in chunk:
                 self.wikidata_id_cache.setdefault(t, None)
 
@@ -351,28 +327,16 @@ class WikipediaClient:
                 self.wikidata_id_cache[title] = wd_id
 
     def ensure_humans_for_titles(self, titles: Set[str]) -> None:
-        """
-        Ensure human_cache is populated (True/False) for all given titles.
-
-        This is the key optimization: instead of calling Wikidata per title,
-        we:
-            - Batch-fetch pageprops for all titles to get Wikidata IDs.
-            - Batch-fetch wbgetentities for all those IDs to see if they are Q5.
-        """
-        # Titles we haven't classified yet.
         to_classify = [t for t in titles if t not in self.human_cache]
         if not to_classify:
             return
 
-        # Step 1: make sure we have Wikidata IDs for all of them.
         self._ensure_pageprops_for_titles(set(to_classify))
 
-        # Map: wd_id -> [titles]
         ids_to_titles: Dict[str, List[str]] = {}
         for t in to_classify:
             wd_id = self.wikidata_id_cache.get(t)
             if not wd_id:
-                # No Wikidata item -> not a human
                 self.human_cache[t] = False
             else:
                 ids_to_titles.setdefault(wd_id, []).append(t)
@@ -380,7 +344,6 @@ class WikipediaClient:
         if not ids_to_titles:
             return
 
-        # Step 2: batch wbgetentities by up to 50 IDs at a time.
         all_ids = list(ids_to_titles.keys())
         chunk_size = 50
         for i in range(0, len(all_ids), chunk_size):
@@ -393,7 +356,6 @@ class WikipediaClient:
             try:
                 data = self._wikidata_get(params)
             except WikipediaAPIError:
-                # If Wikidata fails, pessimistically mark them as non-humans.
                 for wd_id in id_chunk:
                     for title in ids_to_titles.get(wd_id, []):
                         self.human_cache[title] = False
@@ -417,21 +379,11 @@ class WikipediaClient:
                     self.human_cache[title] = is_human_flag
 
     def is_human(self, title: str) -> bool:
-        """
-        Return cached human classification for a title.
-
-        NOTE: In the optimized BFS, you should usually call ensure_humans_for_titles()
-        first on a batch, then this becomes a cheap lookup.
-        """
         return self.human_cache.get(title, False)
 
     # ------------------------ HTML fetch for verification ------------------------
 
     def fetch_html(self, title: str) -> Optional[str]:
-        """
-        Fetch the raw HTML for an article by title, for verification purposes.
-        Returns the HTML as a string, or None on failure.
-        """
         url = f"https://en.wikipedia.org/wiki/{title.replace(' ', '_')}"
         try:
             resp = self.session.get(url, timeout=self.timeout)
@@ -453,19 +405,9 @@ def bidirectional_shortest_path(
     max_expanded: int = 200_000,
     timeout_seconds: int = 600,
 ) -> Tuple[List[str], int]:
-    """
-    Bidirectional BFS over the people-only Wikipedia graph.
-
-    Key optimization:
-        For each BFS wave, we:
-            - Collect all neighbors across the frontier.
-            - Batch-classify them with ensure_humans_for_titles().
-            - Then cheaply filter by client.is_human(title).
-    """
     if start == goal:
         return [start], 0
 
-    # Ensure endpoints are human (using the fast batch system too).
     client.ensure_humans_for_titles({start, goal})
     if not client.is_human(start):
         raise ValueError(f"Start page '{start}' is not classified as a human in Wikidata.")
@@ -489,7 +431,6 @@ def bidirectional_shortest_path(
             )
 
         if len(frontier_forward) <= len(frontier_backward):
-            # Expand forward: collect neighbors for the whole frontier.
             current_frontier = frontier_forward
             next_frontier: Set[str] = set()
             neighbors_by_node: Dict[str, Set[str]] = {}
@@ -501,10 +442,8 @@ def bidirectional_shortest_path(
                 neighbors_by_node[node] = neighbors
                 all_neighbors.update(neighbors)
 
-            # Batch human classification for all neighbors in this wave.
             client.ensure_humans_for_titles(all_neighbors)
 
-            # Now do the actual BFS expansion with cheap lookups.
             for node, neighbors in neighbors_by_node.items():
                 for nbr in neighbors:
                     if not client.is_human(nbr):
@@ -519,7 +458,6 @@ def bidirectional_shortest_path(
             frontier_forward = next_frontier
 
         else:
-            # Expand backward: collect backlinks for the whole frontier.
             current_frontier = frontier_backward
             next_frontier: Set[str] = set()
             neighbors_by_node: Dict[str, Set[str]] = {}
@@ -531,7 +469,6 @@ def bidirectional_shortest_path(
                 neighbors_by_node[node] = neighbors
                 all_neighbors.update(neighbors)
 
-            # Batch human classification for all neighbors in this wave.
             client.ensure_humans_for_titles(all_neighbors)
 
             for node, neighbors in neighbors_by_node.items():
@@ -579,12 +516,6 @@ def _reconstruct_path(
 
 
 def _extract_anchor_and_context(html: str, dst_slug: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Given the HTML of a page and a destination slug (e.g. 'Neil_Diamond'),
-    try to extract:
-        - The full <a ...>...</a> tag that links to that slug.
-        - A short context snippet around it.
-    """
     needle = f'/wiki/{dst_slug}'
     idx = html.find(needle)
     if idx == -1:
@@ -610,21 +541,11 @@ def _extract_anchor_and_context(html: str, dst_slug: str) -> Tuple[Optional[str]
 
 
 def verify_path_links(client: WikipediaClient, path: List[str]) -> None:
-    """
-    For each consecutive pair (A -> B) in the path:
-        - Print the source and target URLs.
-        - Fetch the HTML of A.
-        - Locate an <a href="/wiki/B_Title"> anchor.
-        - Print the anchor tag and a short context snippet.
-    """
     if len(path) < 2:
         print("\nNo edges to verify (path length < 2).")
         return
 
-    print("\n========================================")
-    print("        LINK VERIFICATION SNIPPETS      ")
-    print("========================================")
-
+    print("\nVerification of hyperlinks:")
     for i in range(len(path) - 1):
         src = path[i]
         dst = path[i + 1]
@@ -633,9 +554,9 @@ def verify_path_links(client: WikipediaClient, path: List[str]) -> None:
         src_url = f"https://en.wikipedia.org/wiki/{src_slug}"
         dst_url = f"https://en.wikipedia.org/wiki/{dst_slug}"
 
-        print(f"\nStep {i + 1}: {src} → {dst}")
-        print(f"  Source URL: {src_url}")
-        print(f"  Target URL: {dst_url}")
+        print(f"\nStep {i + 1}: {src} -> {dst}")
+        print(f"  Source: {src_url}")
+        print(f"  Target: {dst_url}")
 
         html = client.fetch_html(src)
         if html is None:
@@ -650,12 +571,10 @@ def verify_path_links(client: WikipediaClient, path: List[str]) -> None:
             )
             continue
 
-        print("  Anchor tag found:")
+        print("  Anchor:")
         print(f"    {anchor}")
-        print("  Context snippet:")
-        print(f"    ...{context}...")
-
-    print("========================================\n")
+        print("  Context:")
+        print(f"    {context}")
 
 
 # ---------------------------------------------------------------------------
@@ -664,12 +583,8 @@ def verify_path_links(client: WikipediaClient, path: List[str]) -> None:
 
 
 def main() -> None:
-    print("======================================================")
-    print("      PEOPLE-ONLY WIKIPEDIA DEGREES OF SEPARATION     ")
-    print("======================================================")
-    print("Finds the shortest path between two people.")
-    print("Constraint: Every step must be a Human (Wikidata Q5).")
-    print("------------------------------------------------------")
+    print("People-only Wikipedia Degrees of Separation (Wikidata Q5)")
+    print("Finds the shortest hyperlink chain between two people.\n")
 
     try:
         raw_a = input("Enter Person A: ").strip()
@@ -690,22 +605,22 @@ def main() -> None:
         title_b = client.resolve_title(raw_b)
         print(f"Resolved Person B to: {title_b}")
 
-        print("\nVerifying endpoints are people...")
+        print("\nChecking that both endpoints are people (Wikidata Q5)...")
         client.ensure_humans_for_titles({title_a, title_b})
         if not client.is_human(title_a):
-            print(f"'{title_a}' is not classified as a human in Wikidata. Exiting.")
+            print(f"'{title_a}' is not classified as a human. Exiting.")
             sys.exit(1)
         if not client.is_human(title_b):
-            print(f"'{title_b}' is not classified as a human in Wikidata. Exiting.")
+            print(f"'{title_b}' is not classified as a human. Exiting.")
             sys.exit(1)
-        print(f"Endpoints verified. Starting search: {title_a} <-> {title_b}")
-        print("Note: Expansion speed is limited by batched Wikidata 'is-human' checks.\n")
 
         if title_a == title_b:
             total_time = time.time() - overall_start
-            print("Both names resolve to the same person. No path needed.")
-            print(f"Total Time: {total_time:.2f} sec")
+            print("\nBoth names resolve to the same person. No path needed.")
+            print(f"Total time: {total_time:.2f} sec")
             sys.exit(0)
+
+        print(f"\nSearching for shortest people-only path: {title_a} -> {title_b} ...")
 
         search_start = time.time()
         path, expanded = bidirectional_shortest_path(
@@ -719,33 +634,24 @@ def main() -> None:
         total_time = time.time() - overall_start
 
         if not path:
-            print("No people-only hyperlink path found within the search constraints.")
-            print(f"Search Time:    {search_time:.2f} sec")
-            print(f"Total Time:     {total_time:.2f} sec")
-            print(f"Nodes Expanded: {expanded}")
+            print("\nNo people-only hyperlink path found within the search constraints.")
+            print(f"Search time: {search_time:.2f} sec")
+            print(f"Total time:  {total_time:.2f} sec")
+            print(f"Nodes expanded: {expanded}")
             sys.exit(0)
 
         if path[0] != title_a or path[-1] != title_b:
-            print("\n[WARNING] Internal path does not start/end with requested endpoints.")
+            print("\n[Warning] Internal path does not start/end with requested endpoints.")
             print("Computed path:", " -> ".join(path))
 
         degrees = len(path) - 1
 
-        print("\n========================================")
-        print("              PATH FOUND!              ")
-        print("========================================")
-        print(f"Degrees of Separation: {degrees}")
-        print("----------------------------------------")
-        for idx, title in enumerate(path, start=1):
-            print(f"{idx}. {title}")
-            if idx < len(path):
-                print("   |")
-                print("   v")
-        print("----------------------------------------")
-        print(f"Search Time:    {search_time:.2f} sec")
-        print(f"Total Time:     {total_time:.2f} sec")
-        print(f"Nodes Expanded: {expanded}")
-        print("========================================")
+        print("\nPath found:")
+        print("  " + " -> ".join(path))
+        print(f"Degrees of separation: {degrees}")
+        print(f"Search time: {search_time:.2f} sec")
+        print(f"Total time:  {total_time:.2f} sec")
+        print(f"Nodes expanded: {expanded}")
 
         verify_path_links(client, path)
 

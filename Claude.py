@@ -496,6 +496,178 @@ def get_person_links(title: str) -> List[str]:
     return list(person_links)
 
 
+def get_article_snippet(source_title: str, target_title: str) -> Optional[str]:
+    """
+    Extract a snippet from the source article that mentions the target.
+    
+    This provides "proof" that the connection exists by showing where
+    the target person is mentioned in the source article.
+    
+    Args:
+        source_title: The article we're reading from
+        target_title: The person being mentioned/linked
+        
+    Returns:
+        A text snippet showing the mention, or None if not found
+    """
+    try:
+        import re
+        
+        # First, try to get plain text extract (full article, not just intro)
+        params = {
+            'action': 'query',
+            'titles': source_title,
+            'prop': 'extracts',
+            'explaintext': '1',
+            'exlimit': '1',
+            'exintro': '0'  # Get full article
+        }
+        
+        data = make_api_request(WIKIPEDIA_API, params)
+        
+        pages = data.get('query', {}).get('pages', {})
+        extract_text = ''
+        
+        for page_data in pages.values():
+            extract_text = page_data.get('extract', '')
+            break
+        
+        if extract_text:
+            # Split into sentences carefully
+            sentences = re.split(r'(?<=[.!?])\s+', extract_text)
+            
+            # Create name variations
+            name_parts = target_title.split()
+            search_patterns = []
+            
+            # Full name (highest priority)
+            search_patterns.append((target_title, 100))
+            
+            # Both first and last name
+            if len(name_parts) >= 2:
+                first_last_pattern = f"{name_parts[0]}.*{name_parts[-1]}"
+                search_patterns.append((first_last_pattern, 80))
+                # Last name only
+                search_patterns.append((name_parts[-1], 50))
+            
+            best_sentence = None
+            best_score = 0
+            
+            for sentence in sentences:
+                sentence = sentence.strip()
+                if len(sentence) < 20:  # Skip very short sentences
+                    continue
+                
+                for pattern, score in search_patterns:
+                    if re.search(re.escape(pattern) if '.*' not in pattern else pattern, 
+                                sentence, re.IGNORECASE):
+                        # Prefer sentences that are not too long
+                        if len(sentence) < 500:
+                            score += 10
+                        if score > best_score:
+                            best_score = score
+                            best_sentence = sentence
+                        break  # Found a match, move to next sentence
+            
+            if best_sentence:
+                # Format the snippet nicely
+                snippet = best_sentence.strip()
+                if len(snippet) > 350:
+                    # Find the name and center around it
+                    name_pos = snippet.lower().find(target_title.lower())
+                    if name_pos == -1 and len(name_parts) >= 2:
+                        name_pos = snippet.lower().find(name_parts[-1].lower())
+                    
+                    if name_pos != -1:
+                        start = max(0, name_pos - 150)
+                        end = min(len(snippet), name_pos + 200)
+                        snippet = snippet[start:end]
+                        if start > 0:
+                            snippet = "..." + snippet
+                        if end < len(best_sentence):
+                            snippet = snippet + "..."
+                    else:
+                        snippet = snippet[:347] + "..."
+                
+                return snippet
+        
+        # Fallback: Try to get wikitext and extract context
+        params = {
+            'action': 'query',
+            'titles': source_title,
+            'prop': 'revisions',
+            'rvprop': 'content',
+            'rvslots': 'main',
+            'formatversion': '2',
+            'rvlimit': '1'
+        }
+        
+        data = make_api_request(WIKIPEDIA_API, params)
+        pages = data.get('query', {}).get('pages', [])
+        
+        if pages:
+            revisions = pages[0].get('revisions', [])
+            if revisions:
+                wikitext = revisions[0].get('slots', {}).get('main', {}).get('content', '')
+                
+                if wikitext:
+                    # Remove wiki markup for cleaner text
+                    # Remove templates {{ }}
+                    wikitext = re.sub(r'\{\{[^}]*\}\}', '', wikitext)
+                    # Remove references <ref>...</ref>
+                    wikitext = re.sub(r'<ref[^>]*>.*?</ref>', '', wikitext, flags=re.DOTALL)
+                    wikitext = re.sub(r'<ref[^>]*/', '', wikitext)
+                    # Remove file/image links
+                    wikitext = re.sub(r'\[\[File:.*?\]\]', '', wikitext, flags=re.IGNORECASE)
+                    wikitext = re.sub(r'\[\[Image:.*?\]\]', '', wikitext, flags=re.IGNORECASE)
+                    
+                    # Look for the target name in wiki links [[Target Name]] or [[Target Name|Display]]
+                    target_escaped = re.escape(target_title)
+                    patterns = [
+                        rf'\[\[{target_escaped}\]\]',
+                        rf'\[\[{target_escaped}\|[^\]]+\]\]',
+                    ]
+                    
+                    for pattern in patterns:
+                        matches = list(re.finditer(pattern, wikitext, re.IGNORECASE))
+                        if matches:
+                            # Get context around first match
+                            match = matches[0]
+                            start = max(0, match.start() - 200)
+                            end = min(len(wikitext), match.end() + 200)
+                            context = wikitext[start:end]
+                            
+                            # Clean up wiki markup
+                            context = re.sub(r'\[\[([^|\]]+)\]\]', r'\1', context)  # [[Link]] -> Link
+                            context = re.sub(r'\[\[[^|]+\|([^\]]+)\]\]', r'\1', context)  # [[Link|Text]] -> Text
+                            context = re.sub(r"'{2,}", '', context)  # Remove bold/italic marks
+                            context = re.sub(r'<[^>]+>', '', context)  # Remove HTML tags
+                            context = re.sub(r'\s+', ' ', context)  # Normalize whitespace
+                            context = context.strip()
+                            
+                            # Extract a sentence
+                            sentences = re.split(r'[.!?]+', context)
+                            for sent in sentences:
+                                sent = sent.strip()
+                                if len(name_parts) >= 2:
+                                    last_name = name_parts[-1]
+                                    if last_name.lower() in sent.lower() and len(sent) > 30:
+                                        if len(sent) > 300:
+                                            sent = sent[:297] + "..."
+                                        return sent
+                            
+                            # Return cleaned context if no good sentence found
+                            if len(context) > 50:
+                                if len(context) > 300:
+                                    context = context[:297] + "..."
+                                return context
+        
+        return None
+        
+    except Exception as e:
+        return None
+
+
 # ============================================================================
 # Bidirectional BFS Search
 # ============================================================================
@@ -537,15 +709,14 @@ def find_shortest_path(start: str, goal: str) -> Optional[List[str]]:
     
     print("\nSearching for path (this may take a minute)...")
     
-    while forward_queue and backward_queue:
+    while forward_queue or backward_queue:
         # Check limits
-        nodes_explored += 1
         if nodes_explored > MAX_NODES_EXPLORED:
             print(f"Reached exploration limit ({MAX_NODES_EXPLORED} nodes)")
             return None
         
         # Expand the smaller frontier (more efficient)
-        if len(forward_queue) <= len(backward_queue):
+        if forward_queue and (not backward_queue or len(forward_queue) <= len(backward_queue)):
             # Forward expansion
             current = forward_queue.popleft()
             current_depth = forward_depth[current]
@@ -559,14 +730,32 @@ def find_shortest_path(start: str, goal: str) -> Optional[List[str]]:
             except:
                 continue
             
+            nodes_explored += 1
+            
             for neighbor in neighbors:
+                # Check if we've reached the goal
+                if neighbor == goal:
+                    # Build path: start -> ... -> current -> goal
+                    path = []
+                    node = current
+                    while node is not None:
+                        path.append(node)
+                        node = forward_parent.get(node)
+                    path.reverse()
+                    path.append(goal)
+                    return path
+                
                 # Check if we've reached the other frontier
                 if neighbor in backward_visited:
                     # Found a meeting point! Reconstruct path
-                    return reconstruct_path(
+                    path = reconstruct_path(
                         start, goal, neighbor,
                         forward_parent, backward_parent
                     )
+                    # Verify the path is complete and correct
+                    if path and path[0] == start and path[-1] == goal:
+                        return path
+                    # Otherwise continue searching
                 
                 # Add to forward frontier
                 if neighbor not in forward_visited:
@@ -575,12 +764,12 @@ def find_shortest_path(start: str, goal: str) -> Optional[List[str]]:
                     forward_depth[neighbor] = current_depth + 1
                     forward_queue.append(neighbor)
             
-            if nodes_explored % 100 == 0:
+            if nodes_explored % 50 == 0:
                 print(f"  Explored {nodes_explored} nodes, "
                       f"forward frontier: {len(forward_queue)}, "
                       f"backward frontier: {len(backward_queue)}")
         
-        else:
+        elif backward_queue:
             # Backward expansion
             current = backward_queue.popleft()
             current_depth = backward_depth[current]
@@ -594,14 +783,30 @@ def find_shortest_path(start: str, goal: str) -> Optional[List[str]]:
             except:
                 continue
             
+            nodes_explored += 1
+            
             for neighbor in neighbors:
+                # Check if we've reached the start
+                if neighbor == start:
+                    # Build path: start -> current -> ... -> goal
+                    path = [start]
+                    node = current
+                    while node is not None:
+                        path.append(node)
+                        node = backward_parent.get(node)
+                    return path
+                
                 # Check if we've reached the other frontier
                 if neighbor in forward_visited:
                     # Found a meeting point! Reconstruct path
-                    return reconstruct_path(
+                    path = reconstruct_path(
                         start, goal, neighbor,
                         forward_parent, backward_parent
                     )
+                    # Verify the path is complete and correct
+                    if path and path[0] == start and path[-1] == goal:
+                        return path
+                    # Otherwise continue searching
                 
                 # Add to backward frontier
                 if neighbor not in backward_visited:
@@ -634,22 +839,30 @@ def reconstruct_path(
     Returns:
         Complete path as a list of titles
     """
-    # Build path from start to meeting point
+    # Build path from start to meeting point (going backwards from meeting point)
     forward_path = []
     current = meeting_point
     while current is not None:
         forward_path.append(current)
-        current = forward_parent[current]
+        current = forward_parent.get(current)
     forward_path.reverse()
     
-    # Build path from meeting point to goal
+    # Build path from meeting point to goal (going backwards from goal)
+    # First, build the path from goal to meeting point, then reverse it
     backward_path = []
-    current = backward_parent[meeting_point]  # Skip meeting point (already in forward)
-    while current is not None:
+    current = goal
+    while current is not None and current != meeting_point:
         backward_path.append(current)
-        current = backward_parent[current]
+        current = backward_parent.get(current)
     
-    # Combine paths
+    # backward_path now goes from goal to meeting point, so reverse it
+    backward_path.reverse()
+    
+    # Skip the meeting point in backward path since it's already in forward path
+    if backward_path and backward_path[0] == meeting_point:
+        backward_path = backward_path[1:]
+    
+    # Combine paths: start -> ... -> meeting_point + meeting_point -> ... -> goal
     return forward_path + backward_path
 
 
@@ -720,8 +933,26 @@ def main():
         if path:
             print("PATH FOUND!")
             print("=" * 70)
-            print(f"\n{' → '.join(path)}")
-            print(f"\nPath length: {len(path) - 1} steps")
+            print(f"\nShortest path: {' → '.join(path)}")
+            print(f"Path length: {len(path) - 1} step{'s' if len(path) - 1 != 1 else ''}")
+            
+            # Show detailed connections
+            print("\n" + "=" * 70)
+            print("CONNECTION DETAILS:")
+            print("=" * 70)
+            
+            for i in range(len(path) - 1):
+                source = path[i]
+                target = path[i + 1]
+                
+                print(f"\n[Step {i + 1}] {source} → {target}")
+                print(f"  📄 {source}: https://en.wikipedia.org/wiki/{urllib.parse.quote(source.replace(' ', '_'))}")
+                print(f"     (This article links to {target})")
+            
+            # Add link to final article
+            print(f"\n[Destination] {path[-1]}")
+            print(f"  📄 {path[-1]}: https://en.wikipedia.org/wiki/{urllib.parse.quote(path[-1].replace(' ', '_'))}")
+            
         else:
             print("NO PATH FOUND")
             print("=" * 70)
